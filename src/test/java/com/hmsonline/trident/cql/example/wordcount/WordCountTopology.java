@@ -74,15 +74,15 @@ public class WordCountTopology {
         TridentState wordCounts =
                 topology.newStream("spout1", spout1)
                         .each(new Fields("sentence"), new Split(), new Fields("word"))
-                        .groupBy(new Fields("word", "source"))
+                        .groupBy(new Fields("source", "word"))
                         .persistentAggregate(CassandraCqlMapState.nonTransactional(new WordCountAndSourceMapper()),
                                 new IntegerCount(), new Fields("count"))
                         .parallelismHint(6);
 
         topology.newDRPCStream("words", drpc)
-                .each(new Fields("args"), new Split(), new Fields("word"))
-                .groupBy(new Fields("word"))
-                .stateQuery(wordCounts, new Fields("word"), new MapGet(), new Fields("count"))
+                .each(new Fields("args"), new Split2(), new Fields("source", "word"))
+                .groupBy(new Fields("source", "word"))
+                .stateQuery(wordCounts, new Fields("source", "word"), new MapGet(), new Fields("count"))
                 .each(new Fields("count"), new FilterNull())
                 .aggregate(new Fields("count"), new Sum(), new Fields("sum"));
 
@@ -99,7 +99,7 @@ public class WordCountTopology {
         cluster.submitTopology("cqlexample", configuration, buildWordCountAndSourceTopology(client));
         LOG.info("Topology submitted.");
         Thread.sleep(100000);
-        LOG.info("DRPC Query: Word Count [cat, dog, the, man]: {}", client.execute("words", "cat dog the man"));
+        LOG.info("DRPC Query: Word Count [cat, dog, the, man]: {}", client.execute("words", "spout1,cat spout1,dog spout1,the spout1,man"));
         cluster.shutdown();
         client.shutdown();
     }
