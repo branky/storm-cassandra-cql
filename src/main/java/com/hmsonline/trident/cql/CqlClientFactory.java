@@ -1,21 +1,14 @@
 package com.hmsonline.trident.cql;
 
 import java.io.Serializable;
-import java.net.InetSocketAddress;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
+import com.datastax.driver.core.*;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.datastax.driver.core.Cluster;
-import com.datastax.driver.core.ConsistencyLevel;
-import com.datastax.driver.core.ProtocolOptions;
-import com.datastax.driver.core.QueryOptions;
-import com.datastax.driver.core.Session;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 
 /**
@@ -70,24 +63,15 @@ public class CqlClientFactory implements Serializable {
     }
     
     public Cluster getCluster() {
-        if (cluster == null || cluster.isClosed()) {
-            if (cluster != null && cluster.isClosed()){
-                LOG.warn("Cluster closed, reconstructing cluster for [{}]", cluster.getClusterName());
-            }
+        if (cluster == null)
+//|| cluster.isClosed()) { -- old driver not support
+//            if (cluster != null && cluster.isClosed()){
+//                LOG.warn("Cluster closed, reconstructing cluster for [{}]", cluster.getClusterName());
+//            }
             try {
-                List<InetSocketAddress> sockets = new ArrayList<InetSocketAddress>();
-                for (String host : hosts) {
-                    if(StringUtils.contains(host, ":")) {
-                        String hostParts [] = StringUtils.split(host, ":");
-                        sockets.add(new InetSocketAddress(hostParts[0], Integer.valueOf(hostParts[1])));
-                        LOG.debug("Connecting to [" + host + "] with port [" + hostParts[1] + "]");
-                    } else {
-                        sockets.add(new InetSocketAddress(host, ProtocolOptions.DEFAULT_PORT));
-                        LOG.debug("Connecting to [" + host + "] with port [" + ProtocolOptions.DEFAULT_PORT + "]");
-                    }
-                }
 
-                Cluster.Builder builder = Cluster.builder().addContactPointsWithPorts(sockets);
+
+                Cluster.Builder builder = Cluster.builder().addContactPoints(hosts);
                 QueryOptions queryOptions = new QueryOptions();
                 queryOptions.setConsistencyLevel(consistencyLevel);
                 queryOptions.setSerialConsistencyLevel(serialConsistencyLevel);
@@ -105,7 +89,7 @@ public class CqlClientFactory implements Serializable {
             } catch (NoHostAvailableException e) {
                 throw new RuntimeException(e);
             }
-        }
+
         return cluster;
     }
 }
