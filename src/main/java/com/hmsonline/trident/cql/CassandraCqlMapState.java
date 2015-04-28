@@ -1,49 +1,26 @@
 package com.hmsonline.trident.cql;
 
-import java.io.Serializable;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-
+import backtype.storm.Config;
+import backtype.storm.metric.api.CountMetric;
+import backtype.storm.task.IMetricsContext;
+import backtype.storm.topology.ReportedFailedException;
+import com.datastax.driver.core.*;
+import com.datastax.driver.core.BatchStatement.Type;
+import com.datastax.driver.core.exceptions.*;
+import com.hmsonline.trident.cql.mappers.CqlRowMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import storm.trident.state.OpaqueValue;
 import storm.trident.state.StateFactory;
 import storm.trident.state.StateType;
 import storm.trident.state.TransactionalValue;
 import storm.trident.state.map.IBackingMap;
-import backtype.storm.Config;
-import backtype.storm.metric.api.CountMetric;
-import backtype.storm.task.IMetricsContext;
-import backtype.storm.topology.ReportedFailedException;
 
-import com.datastax.driver.core.BatchStatement;
-import com.datastax.driver.core.BatchStatement.Type;
-import com.datastax.driver.core.ConsistencyLevel;
-import com.datastax.driver.core.ResultSet;
-import com.datastax.driver.core.Row;
-import com.datastax.driver.core.Session;
-import com.datastax.driver.core.Statement;
-import com.datastax.driver.core.exceptions.AlreadyExistsException;
-import com.datastax.driver.core.exceptions.AuthenticationException;
-import com.datastax.driver.core.exceptions.DriverException;
-import com.datastax.driver.core.exceptions.DriverInternalError;
-import com.datastax.driver.core.exceptions.InvalidConfigurationInQueryException;
-import com.datastax.driver.core.exceptions.InvalidQueryException;
-import com.datastax.driver.core.exceptions.InvalidTypeException;
-import com.datastax.driver.core.exceptions.QueryExecutionException;
-import com.datastax.driver.core.exceptions.QueryTimeoutException;
-import com.datastax.driver.core.exceptions.QueryValidationException;
-import com.datastax.driver.core.exceptions.ReadTimeoutException;
-import com.datastax.driver.core.exceptions.SyntaxError;
-import com.datastax.driver.core.exceptions.TraceRetrievalException;
-import com.datastax.driver.core.exceptions.TruncateException;
-import com.datastax.driver.core.exceptions.UnauthorizedException;
-import com.datastax.driver.core.exceptions.UnavailableException;
-import com.datastax.driver.core.exceptions.WriteTimeoutException;
-import com.hmsonline.trident.cql.mappers.CqlRowMapper;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 
 /**
  * @param <T> The generic state to back
@@ -59,6 +36,7 @@ public class CassandraCqlMapState<T> implements IBackingMap<T> {
         public String keyspace = "mykeyspace";
         public String tableName = "mytable";
         public Integer ttl = 86400; // 1 day
+        public boolean async = false;
     }
 
     /////////////////////////////////////////////
@@ -101,11 +79,13 @@ public class CassandraCqlMapState<T> implements IBackingMap<T> {
     //////////////////////////////
     // Instance Variables
     //////////////////////////////
-    // private Options<T> options;
+    private Options<T> options;
     private final Session session;
 
     @SuppressWarnings("rawtypes")
     private CqlRowMapper mapper;
+    
+    private PreparedStatement preparedStatement;
 
     // Metrics for storm metrics registering
     CountMetric _mreads;
@@ -114,7 +94,7 @@ public class CassandraCqlMapState<T> implements IBackingMap<T> {
 
     @SuppressWarnings({"rawtypes"})
     public CassandraCqlMapState(Session session, CqlRowMapper mapper, Options<T> options, Map conf) {
-        //this.options = options;
+        this.options = options;
         this.session = session;
         this.mapper = mapper;
     }
@@ -158,32 +138,60 @@ public class CassandraCqlMapState<T> implements IBackingMap<T> {
     @Override
     public void multiPut(List<List<Object>> keys, List<T> values) {
         LOG.debug("Putting the following keys: {} with values: {}", keys, values);
-        try {
-            List<Statement> statements = new ArrayList<Statement>();
-
-            // Retrieve the mapping statement for the key,val pair
-            for (int i = 0; i < keys.size(); i++) {
-                List<Object> key = keys.get(i);
-                T val = values.get(i);
-                Statement retrievedStatment = mapper.map(key, val);
-                if (retrievedStatment instanceof BatchStatement) { // Allows for BatchStatements to be returned by the mapper.
-					BatchStatement batchedStatment = (BatchStatement) retrievedStatment;
-					statements.addAll(batchedStatment.getStatements());
-				} else {
-					statements.add(retrievedStatment);
-				}
+        if (options.async) {
+            try {
+                List<ResultSetFuture> futures = new ArrayList<ResultSetFuture>(keys.size());
+                for (int i = 0; i < keys.size(); i++) {
+                    List<Object> key = keys.get(i);
+                    T val = values.get(i);
+                    RegularStatement retrievedStatment = (RegularStatement)mapper.map(key, val);
+                    if (preparedStatement == null) {
+                        preparedStatement = session.prepare(retrievedStatment);
+                    }
+                    Object[] bindValues = new Object[key.size() + 1];
+                    bindValues = key.toArray(bindValues);
+                    bindValues[bindValues.length - 1] = val;
+                    BoundStatement bind = preparedStatement.bind(bindValues);
+                    ResultSetFuture future = session.executeAsync(bind);
+                    futures.add(future);
+                }
+                for(ResultSetFuture future: futures){
+                    future.getUninterruptibly();
+                    _mwrites.incrBy(1);
+                }
+            } catch (Exception e) {
+                checkCassandraException(e);
+                LOG.error("Exception {} caught.", e);
             }
 
-            // Execute all the statements as a batch.
-            BatchStatement batch = new BatchStatement(Type.LOGGED);
-            batch.addAll(statements);
-            session.execute(batch);
+        } else {
+            try {
+                List<Statement> statements = new ArrayList<Statement>();
+                // Retrieve the mapping statement for the key,val pair
+                for (int i = 0; i < keys.size(); i++) {
+                    List<Object> key = keys.get(i);
+                    T val = values.get(i);
+                    Statement retrievedStatment = mapper.map(key, val);
+                    if (retrievedStatment instanceof BatchStatement) { // Allows for BatchStatements to be returned by the mapper.
+                        BatchStatement batchedStatment = (BatchStatement) retrievedStatment;
+                        statements.addAll(batchedStatment.getStatements());
+                    } else {
+                        statements.add(retrievedStatment);
+                    }
+                }
 
-            _mwrites.incrBy(statements.size());
-        } catch (Exception e) {
-            checkCassandraException(e);
-            LOG.error("Exception {} caught.", e);
+                // Execute all the statements as a batch.
+                BatchStatement batch = new BatchStatement(Type.LOGGED);
+                batch.addAll(statements);
+                session.execute(batch);
+
+                _mwrites.incrBy(statements.size());
+            } catch (Exception e) {
+                checkCassandraException(e);
+                LOG.error("Exception {} caught.", e);
+            }
         }
+
     }
 
     private void checkCassandraException(Exception e) {
